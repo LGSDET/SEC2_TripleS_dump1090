@@ -48,6 +48,7 @@
 #include <rtl-sdr.h>
 
 #include "anet.h"
+#include <arpa/inet.h>
 
 #define MODES_DEFAULT_RATE         2000000
 #define MODES_DEFAULT_FREQ         1090000000
@@ -96,6 +97,21 @@
 
 #define MODES_NOTUSED(V) ((void) V)
 
+const char* trusted_ips[] = {
+    "127.0.0.1",      // Local host
+    "192.168.0.100",  // Example: Trusted client
+    NULL
+};
+
+int is_trusted_ip(const char* ip) {
+    int i = 0;
+    while (trusted_ips[i]) {
+        if (strcmp(ip, trusted_ips[i]) == 0)
+            return 1;
+        i++;
+    }
+    return 0;
+}
 
 /* Structure used to describe a networking client. */
 struct client {
@@ -2002,6 +2018,9 @@ void modesAcceptClients(void) {
     struct client *c;
 
     for (j = 0; j < MODES_NET_SERVICES_NUM; j++) {
+        struct sockaddr_in addr;
+        socklen_t addrlen = sizeof(addr);
+        char client_ip[INET_ADDRSTRLEN];
         fd = anetTcpAccept(Modes.aneterr, *modesNetServices[j].socket,
                            NULL, &port);
         if (fd == -1) {
@@ -2009,6 +2028,16 @@ void modesAcceptClients(void) {
                 printf("Accept %d: %s\n", *modesNetServices[j].socket,
                        strerror(errno));
             continue;
+        }
+        
+        inet_ntop(AF_INET, &addr.sin_addr, client_ip, sizeof(client_ip));
+
+        if (*modesNetServices[j].socket == Modes.ris) {
+            if (!is_trusted_ip(client_ip)) {
+                printf("Blocked connection from untrusted IP: %s\n", client_ip);
+                close(fd);
+                continue;
+            }
         }
 
         if (fd >= MODES_NET_MAX_FD) {
