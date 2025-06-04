@@ -1,5 +1,12 @@
-CFLAGS?=-O2 -g -Wall -W $(shell pkg-config --cflags librtlsdr)
-LDLIBS+=$(shell pkg-config --libs librtlsdr) -lpthread -lm
+#CFLAGS?=-O2 -g -Wall -W $(shell pkg-config --cflags librtlsdr)
+#LDLIBS+=$(shell pkg-config --libs librtlsdir) -lpthread -lm -lssl -lcrypto
+#OpenSSL 경로 자동 설정 (Mac과 Linux 모두 대응)
+OPENSSL_INC := $(shell if [ -d /opt/homebrew/opt/openssl@3/include ]; then echo -I/opt/homebrew/opt/openssl@3/include; else echo -I/usr/include/openssl; fi)
+OPENSSL_LIB := $(shell if [ -d /opt/homebrew/opt/openssl@3/lib ]; then echo -L/opt/homebrew/opt/openssl@3/lib; else echo -L/usr/lib; fi)
+
+CFLAGS ?= -O2 -g -Wall -W $(shell pkg-config --cflags librtlsdr) $(OPENSSL_INC)
+LDLIBS += $(shell pkg-config --libs librtlsdr) $(OPENSSL_LIB) -lssl -lcrypto -lpthread -lm
+
 CC?=gcc
 PROGNAME=dump1090
 
