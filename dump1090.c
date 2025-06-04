@@ -43,7 +43,10 @@
 #include <sys/stat.h>
 #include <sys/ioctl.h>
 #include <sys/select.h>
-#include "rtl-sdr.h"
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+#include <rtl-sdr.h>
+
 #include "anet.h"
 
 #define MODES_DEFAULT_RATE         2000000
@@ -93,12 +96,14 @@
 
 #define MODES_NOTUSED(V) ((void) V)
 
+
 /* Structure used to describe a networking client. */
 struct client {
     int fd;         /* File descriptor. */
     int service;    /* TCP port the client is connected to. */
     char buf[MODES_CLIENT_BUF_SIZE+1];    /* Read buffer. */
     int buflen;                         /* Amount of data on buffer. */
+    SSL *ssl;
 };
 
 /* Structure used to describe an aircraft in iteractive mode. */
@@ -161,6 +166,8 @@ struct {
     int raw;                        /* Raw output format. */
     int debug;                      /* Debugging mode. */
     int net;                        /* Enable networking. */
+    int tls;
+    int local;
     int net_only;                   /* Enable just networking. */
     int interactive;                /* Interactive mode */
     int interactive_rows;           /* Interactive mode: max number of rows. */
@@ -245,6 +252,35 @@ int getTermRows();
 
 /* ============================= Utility functions ========================== */
 
+SSL_CTX *tls_ctx = NULL;
+
+void init_tls(const char *cert, const char *key) {
+    SSL_load_error_strings();
+    OpenSSL_add_ssl_algorithms();
+    tls_ctx = SSL_CTX_new(TLS_server_method());
+    if (!tls_ctx) {
+        fprintf(stderr, "Unable to create SSL context\n");
+        exit(1);
+    }
+    // Load certificate from file
+    if (SSL_CTX_use_certificate_file(tls_ctx, cert, SSL_FILETYPE_PEM) <= 0) {
+        fprintf(stderr, "Failed to load certificate from %s\n", cert);
+        ERR_print_errors_fp(stderr);
+        exit(1);
+    }
+    // Load private key from file
+    if (SSL_CTX_use_PrivateKey_file(tls_ctx, key, SSL_FILETYPE_PEM) <= 0) {
+        fprintf(stderr, "Failed to load private key from %s\n", key);
+        ERR_print_errors_fp(stderr);
+        exit(1);
+    }
+    // Verify that the private key matches the certificate
+    if (!SSL_CTX_check_private_key(tls_ctx)) {
+        fprintf(stderr, "Private key does not match the certificate public key\n");
+        exit(1);
+    }
+}
+
 static long long mstime(void) {
     struct timeval tv;
     long long mst;
@@ -267,6 +303,8 @@ void modesInitConfig(void) {
     Modes.check_crc = 1;
     Modes.raw = 0;
     Modes.net = 0;
+    Modes.tls = 0;
+    Modes.local = 0;
     Modes.net_only = 0;
     Modes.onlyaddr = 0;
     Modes.debug = 0;
@@ -341,16 +379,18 @@ void modesInit(void) {
 
 void modesInitRTLSDR(void) {
     int j;
-    int device_count;
+    int device_count = 0;
     int ppm_error = 0;
     char vendor[256], product[256], serial[256];
 
-    device_count = rtlsdr_get_device_count();
-    if (!device_count) {
-        fprintf(stderr, "No supported RTLSDR devices found.\n");
-        exit(1);
+    if (!Modes.local){
+        device_count = rtlsdr_get_device_count();
+        if (!device_count) {
+            fprintf(stderr, "No supported RTLSDR devices found.\n");
+            exit(1);
+        }
     }
-
+    
     fprintf(stderr, "Found %d device(s):\n", device_count);
     for (j = 0; j < device_count; j++) {
         rtlsdr_get_device_usb_strings(j, vendor, product, serial);
@@ -358,12 +398,14 @@ void modesInitRTLSDR(void) {
             (j == Modes.dev_index) ? "(currently selected)" : "");
     }
 
-    if (rtlsdr_open(&Modes.dev, Modes.dev_index) < 0) {
-        fprintf(stderr, "Error opening the RTLSDR device: %s\n",
-            strerror(errno));
-        exit(1);
+    if (!Modes.local){
+        if (rtlsdr_open(&Modes.dev, Modes.dev_index) < 0) {
+            fprintf(stderr, "Error opening the RTLSDR device: %s\n",
+                strerror(errno));
+            exit(1);
+        }
     }
-
+    
     /* Set gain, frequency, sample rate, and reset the device. */
     rtlsdr_set_tuner_gain_mode(Modes.dev,
         (Modes.gain == MODES_AUTO_GAIN) ? 0 : 1);
@@ -1979,6 +2021,18 @@ void modesAcceptClients(void) {
         c->service = *modesNetServices[j].socket;
         c->fd = fd;
         c->buflen = 0;
+        c->ssl = NULL;
+
+        if (c->service == Modes.ros) {
+            c->ssl = SSL_new(tls_ctx);
+            SSL_set_fd(c->ssl, fd);
+            if (SSL_accept(c->ssl) <= 0) {
+                SSL_free(c->ssl);
+                close(fd);
+                free(c);
+                continue; // handshake 실패 시
+            }
+        }
         Modes.clients[fd] = c;
         anetSetSendBuffer(Modes.aneterr,fd,MODES_NET_SNDBUF_SIZE);
 
@@ -1995,6 +2049,10 @@ void modesAcceptClients(void) {
 
 /* On error free the client, collect the structure, adjust maxfd if needed. */
 void modesFreeClient(int fd) {
+    if (Modes.clients[fd]->ssl) {
+        SSL_shutdown(Modes.clients[fd]->ssl);
+        SSL_free(Modes.clients[fd]->ssl);
+    }
     close(fd);
     free(Modes.clients[fd]);
     Modes.clients[fd] = NULL;
@@ -2026,7 +2084,12 @@ void modesSendAllClients(int service, void *msg, int len) {
     for (j = 0; j <= Modes.maxfd; j++) {
         c = Modes.clients[j];
         if (c && c->service == service) {
-            int nwritten = write(j, msg, len);
+            int nwritten;
+            if (c->ssl) {
+                nwritten = SSL_write(c->ssl, msg, len);
+            } else {
+                nwritten = write(j, msg, len);
+            }
             if (nwritten != len) {
                 modesFreeClient(j);
             }
@@ -2383,7 +2446,7 @@ void modesReadFromClients(void) {
 
     for (j = 0; j <= Modes.maxfd; j++) {
         if ((c = Modes.clients[j]) == NULL) continue;
-        if (c->service == Modes.ris)
+        if (c->service == Modes.ris) // soy
             modesReadFromClient(c,"\n",decodeHexMessage);
         else if (c->service == Modes.https)
             modesReadFromClient(c,"\r\n\r\n",handleHTTPRequest);
@@ -2531,6 +2594,10 @@ int main(int argc, char **argv) {
             Modes.raw = 1;
         } else if (!strcmp(argv[j],"--net")) {
             Modes.net = 1;
+        } else if (!strcmp(argv[j],"--tls")) {
+            Modes.tls = 1;
+        } else if (!strcmp(argv[j],"--local")) {
+            Modes.local = 1;
         } else if (!strcmp(argv[j],"--net-only")) {
             Modes.net = 1;
             Modes.net_only = 1;
@@ -2606,7 +2673,10 @@ int main(int argc, char **argv) {
             exit(1);
         }
     }
-    if (Modes.net) modesInitNet();
+    if (Modes.net) {
+        if (Modes.tls) init_tls("/etc/ssl/tripleS/cert.pem", "/etc/ssl/tripleS/key.pem");
+        modesInitNet();
+    }
 
     /* If the user specifies --net-only, just run in order to serve network
      * clients without reading data from the RTL device. */
@@ -2659,6 +2729,10 @@ int main(int argc, char **argv) {
     }
 
     rtlsdr_close(Modes.dev);
+    if (tls_ctx) {
+        SSL_CTX_free(tls_ctx);
+        EVP_cleanup();
+    }
     return 0;
 }
 
