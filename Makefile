@@ -4,8 +4,8 @@
 OPENSSL_INC := $(shell if [ -d /opt/homebrew/opt/openssl@3/include ]; then echo -I/opt/homebrew/opt/openssl@3/include; else echo -I/usr/include/openssl; fi)
 OPENSSL_LIB := $(shell if [ -d /opt/homebrew/opt/openssl@3/lib ]; then echo -L/opt/homebrew/opt/openssl@3/lib; else echo -L/usr/lib; fi)
 
-CFLAGS ?= -O2 -g -Wall -W $(shell pkg-config --cflags librtlsdr) $(OPENSSL_INC)
-LDLIBS += $(shell pkg-config --libs librtlsdr) $(OPENSSL_LIB) -lssl -lcrypto -lpthread -lm
+CFLAGS ?= -O2 -g -Wall -W $(shell pkg-config --cflags librtlsdr) $(OPENSSL_INC) -I/usr/include/json-c
+LDLIBS += $(shell pkg-config --libs librtlsdr) $(OPENSSL_LIB) -lssl -lcrypto -lpthread -lm -ljson-c
 
 CC?=gcc
 PROGNAME=dump1090
