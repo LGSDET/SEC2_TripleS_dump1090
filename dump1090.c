@@ -320,7 +320,6 @@ void modesInitConfig(void) {
     Modes.raw = 0;
     Modes.net = 0;
     Modes.tls = 0;
-    Modes.local = 0;
     Modes.net_only = 0;
     Modes.onlyaddr = 0;
     Modes.debug = 0;
@@ -399,12 +398,10 @@ void modesInitRTLSDR(void) {
     int ppm_error = 0;
     char vendor[256], product[256], serial[256];
 
-    if (!Modes.local){
-        device_count = rtlsdr_get_device_count();
-        if (!device_count) {
-            fprintf(stderr, "No supported RTLSDR devices found.\n");
-            exit(1);
-        }
+    device_count = rtlsdr_get_device_count();
+    if (!device_count) {
+        fprintf(stderr, "No supported RTLSDR devices found.\n");
+        exit(1);
     }
     
     fprintf(stderr, "Found %d device(s):\n", device_count);
@@ -414,12 +411,10 @@ void modesInitRTLSDR(void) {
             (j == Modes.dev_index) ? "(currently selected)" : "");
     }
 
-    if (!Modes.local){
-        if (rtlsdr_open(&Modes.dev, Modes.dev_index) < 0) {
-            fprintf(stderr, "Error opening the RTLSDR device: %s\n",
-                strerror(errno));
-            exit(1);
-        }
+    if (rtlsdr_open(&Modes.dev, Modes.dev_index) < 0) {
+        fprintf(stderr, "Error opening the RTLSDR device: %s\n",
+            strerror(errno));
+        exit(1);
     }
     
     /* Set gain, frequency, sample rate, and reset the device. */
@@ -2053,9 +2048,19 @@ void modesAcceptClients(void) {
         c->ssl = NULL;
 
         if (c->service == Modes.ros) {
+            inet_ntop(AF_INET, &addr.sin_addr, client_ip, sizeof(client_ip));
+            printf("Trying to connect with TLS Comm..%s\n", client_ip);
             c->ssl = SSL_new(tls_ctx);
             SSL_set_fd(c->ssl, fd);
-            if (SSL_accept(c->ssl) <= 0) {
+            int flags = fcntl(fd, F_GETFL, 0);
+            fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
+            int ret = SSL_accept(c->ssl);
+            int err = SSL_get_error(c->ssl, ret);
+            if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE){
+                continue;
+            }
+            else if (ret <= 0) {
+                printf("Fail to handshaking\n");
                 SSL_free(c->ssl);
                 close(fd);
                 free(c);
@@ -2064,8 +2069,9 @@ void modesAcceptClients(void) {
         }
         Modes.clients[fd] = c;
         anetSetSendBuffer(Modes.aneterr,fd,MODES_NET_SNDBUF_SIZE);
+        printf("Success to handshaking\n");
 
-        if (Modes.maxfd < fd) Modes.maxfd = fd;
+        if (Modes.maxfd < fd) Modes.maxfd = fd; 
         if (*modesNetServices[j].socket == Modes.sbsos)
             Modes.stat_sbs_connections++;
 
@@ -2625,8 +2631,6 @@ int main(int argc, char **argv) {
             Modes.net = 1;
         } else if (!strcmp(argv[j],"--tls")) {
             Modes.tls = 1;
-        } else if (!strcmp(argv[j],"--local")) {
-            Modes.local = 1;
         } else if (!strcmp(argv[j],"--net-only")) {
             Modes.net = 1;
             Modes.net_only = 1;
