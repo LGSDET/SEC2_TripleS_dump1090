@@ -45,7 +45,11 @@
 #include <sys/select.h>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
+#include <openssl/bio.h>
+#include <openssl/evp.h>
+#include <openssl/buffer.h>
 #include <rtl-sdr.h>
+#include <json-c/json.h>
 
 #include "anet.h"
 #include <arpa/inet.h>
@@ -97,6 +101,21 @@
 
 #define MODES_NOTUSED(V) ((void) V)
 
+/* Structure used to describe a networking client. */
+struct client {
+    int fd;         /* File descriptor. */
+    int service;    /* TCP port the client is connected to. */
+    char buf[MODES_CLIENT_BUF_SIZE+1];    /* Read buffer. */
+    int buflen;                         /* Amount of data on buffer. */
+    SSL *ssl;
+    int authenticated;                  /* Authentication status */
+};
+
+// Function declarations
+char *base64_decode(const char *input, int length, int *outlen);
+int handleClientAuth(struct client *c);
+int verifyPassword(const char *received_hash);
+
 const char* trusted_ips[] = {
     "127.0.0.1",      // Local host
     "192.168.0.100",  // Example: Trusted client
@@ -112,15 +131,6 @@ int is_trusted_ip(const char* ip) {
     }
     return 0;
 }
-
-/* Structure used to describe a networking client. */
-struct client {
-    int fd;         /* File descriptor. */
-    int service;    /* TCP port the client is connected to. */
-    char buf[MODES_CLIENT_BUF_SIZE+1];    /* Read buffer. */
-    int buflen;                         /* Amount of data on buffer. */
-    SSL *ssl;
-};
 
 /* Structure used to describe an aircraft in iteractive mode. */
 struct aircraft {
@@ -2011,28 +2021,18 @@ void modesAcceptClients(void) {
     int fd, port;
     unsigned int j;
     struct client *c;
+    struct sockaddr_in addr;
+    socklen_t addrlen = sizeof(addr);
+    char client_ip[INET_ADDRSTRLEN];
 
     for (j = 0; j < MODES_NET_SERVICES_NUM; j++) {
-        struct sockaddr_in addr;
-        socklen_t addrlen = sizeof(addr);
-        char client_ip[INET_ADDRSTRLEN];
         fd = anetTcpAccept(Modes.aneterr, *modesNetServices[j].socket,
-                           NULL, &port);
+                        client_ip, &port);
         if (fd == -1) {
             if (Modes.debug & MODES_DEBUG_NET && errno != EAGAIN)
                 printf("Accept %d: %s\n", *modesNetServices[j].socket,
                        strerror(errno));
             continue;
-        }
-        
-        inet_ntop(AF_INET, &addr.sin_addr, client_ip, sizeof(client_ip));
-
-        if (*modesNetServices[j].socket == Modes.ris) {
-            if (!is_trusted_ip(client_ip)) {
-                printf("Blocked connection from untrusted IP: %s\n", client_ip);
-                close(fd);
-                continue;
-            }
         }
 
         if (fd >= MODES_NET_MAX_FD) {
@@ -2041,41 +2041,65 @@ void modesAcceptClients(void) {
         }
 
         anetNonBlock(Modes.aneterr, fd);
+        anetTcpNoDelay(Modes.aneterr, fd);
+
         c = malloc(sizeof(*c));
         c->service = *modesNetServices[j].socket;
         c->fd = fd;
         c->buflen = 0;
         c->ssl = NULL;
+        c->authenticated = 0;  // 명시적으로 초기화
+        printf("New client connected from %s on port %d. Initial authenticated status: %d\n", 
+               client_ip, port, c->authenticated);
 
-        if (c->service == Modes.ros) {
-            inet_ntop(AF_INET, &addr.sin_addr, client_ip, sizeof(client_ip));
-            printf("Trying to connect with TLS Comm..%s\n", client_ip);
+        // TLS 연결 처리 (raw output과 SBS output 포트에 대해)
+        if (Modes.tls && (c->service == Modes.ros || c->service == Modes.sbsos)) {
+            printf("Starting TLS handshake for client %s on port %d\n", client_ip, port);
             c->ssl = SSL_new(tls_ctx);
-            SSL_set_fd(c->ssl, fd);
-            int flags = fcntl(fd, F_GETFL, 0);
-            fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
-            int ret = SSL_accept(c->ssl);
-            int err = SSL_get_error(c->ssl, ret);
-            if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE){
+            if (!c->ssl) {
+                fprintf(stderr, "Error creating SSL for client %s\n", client_ip);
+                free(c);
+                close(fd);
                 continue;
             }
-            else if (ret <= 0) {
-                printf("Fail to handshaking\n");
+
+            SSL_set_fd(c->ssl, fd);
+            
+            // TLS 핸드셰이크를 위해 일시적으로 non-blocking 해제
+            int flags = fcntl(fd, F_GETFL, 0);
+            fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
+            
+            if (SSL_accept(c->ssl) <= 0) {
+                fprintf(stderr, "TLS handshake failed with client %s\n", client_ip);
                 SSL_free(c->ssl);
-                close(fd);
                 free(c);
-                continue; // handshake 실패 시
+                close(fd);
+                continue;
             }
+            
+            // non-blocking 모드 복원
+            fcntl(fd, F_SETFL, flags);
+            
+            printf("TLS handshake completed with client %s\n", client_ip);
+
+            // 인증 처리
+            if (!handleClientAuth(c)) {
+                printf("Authentication failed for client %s\n", client_ip);
+                SSL_free(c->ssl);
+                free(c);
+                close(fd);
+                continue;
+            }
+            printf("Authentication successful for client %s\n", client_ip);
         }
+
+        /* Add to clients list and set the maximum fd if needed. */
         Modes.clients[fd] = c;
-        anetSetSendBuffer(Modes.aneterr,fd,MODES_NET_SNDBUF_SIZE);
-        printf("Success to handshaking\n");
+        anetSetSendBuffer(Modes.aneterr, fd, MODES_NET_SNDBUF_SIZE);
 
-        if (Modes.maxfd < fd) Modes.maxfd = fd; 
-        if (*modesNetServices[j].socket == Modes.sbsos)
+        if (fd > Modes.maxfd) Modes.maxfd = fd;
+        if (c->service == Modes.sbsos)
             Modes.stat_sbs_connections++;
-
-        j--; /* Try again with the same listening port. */
 
         if (Modes.debug & MODES_DEBUG_NET)
             printf("Created new client %d\n", fd);
@@ -2118,7 +2142,7 @@ void modesSendAllClients(int service, void *msg, int len) {
 
     for (j = 0; j <= Modes.maxfd; j++) {
         c = Modes.clients[j];
-        if (c && c->service == service) {
+        if (c && c->service == service && c->authenticated) {  // 인증된 클라이언트만 메시지 전송
             int nwritten;
             if (c->ssl) {
                 nwritten = SSL_write(c->ssl, msg, len);
@@ -2769,4 +2793,179 @@ int main(int argc, char **argv) {
     return 0;
 }
 
+/* Base64 디코딩 함수 */
+char *base64_decode(const char *input, int length, int *outlen) {
+    BIO *b64, *bmem;
+    
+    // SHA-256 해시(64자)를 base64로 인코딩하면 약 88자가 됩니다.
+    // 여유있게 128바이트 할당
+    char *buffer = (char *)malloc(128);
+    if (!buffer) {
+        printf("Memory allocation failed\n");
+        return NULL;
+    }
+    memset(buffer, 0, 128);
+
+    b64 = BIO_new(BIO_f_base64());
+    if (!b64) {
+        printf("Failed to create base64 BIO\n");
+        free(buffer);
+        return NULL;
+    }
+
+    BIO_set_flags(b64, BIO_FLAGS_BASE64_NO_NL); // 개행 무시
+    bmem = BIO_new_mem_buf(input, length);
+    if (!bmem) {
+        printf("Failed to create memory BIO\n");
+        BIO_free_all(b64);
+        free(buffer);
+        return NULL;
+    }
+
+    bmem = BIO_push(b64, bmem);
+    *outlen = BIO_read(bmem, buffer, 128);  // 버퍼 크기 128로 수정
+    
+    printf("Base64 input length: %d\n", length);
+    printf("Base64 input: %s\n", input);
+    printf("Decoded length: %d\n", *outlen);
+    printf("Decoded output: %s\n", buffer);
+
+    BIO_free_all(bmem);
+
+    return buffer;
+}
+
+/* Verify client password against stored hash */
+int verifyPassword(const char *received_hash) {
+    json_object *root;
+    json_object *stored_hash_obj;
+    const char *stored_hash;
+    FILE *fp;
+    char buffer[4096];
+    size_t size;
+
+    // Read config file
+    fp = fopen("config.json", "r");
+    if (!fp) {
+        fprintf(stderr, "Error opening config.json\n");
+        return 0;
+    }
+
+    size = fread(buffer, 1, sizeof(buffer), fp);
+    fclose(fp);
+
+    if (size == 0) {
+        fprintf(stderr, "Error reading config.json\n");
+        return 0;
+    }
+
+    buffer[size] = '\0';
+
+    // Parse JSON
+    root = json_tokener_parse(buffer);
+    if (!root) {
+        fprintf(stderr, "Error parsing config.json\n");
+        return 0;
+    }
+
+    // Get password hash
+    if (!json_object_object_get_ex(root, "admin_password_hash", &stored_hash_obj)) {
+        fprintf(stderr, "Error: admin_password_hash not found in config.json\n");
+        json_object_put(root);
+        return 0;
+    }
+
+    stored_hash = json_object_get_string(stored_hash_obj);
+    if (!stored_hash) {
+        fprintf(stderr, "Error: admin_password_hash is not a string\n");
+        json_object_put(root);
+        return 0;
+    }
+
+    printf("Stored hash: %s\n", stored_hash);
+    printf("Received hash: %s\n", received_hash);
+    int result = (strcmp(received_hash, stored_hash) == 0);
+    json_object_put(root);
+    return result;
+}
+
+/* Handle client authentication */
+int handleClientAuth(struct client *c) {
+    char auth_buf[256];
+    int bytes;
+    
+    printf("Reading authentication data...\n");
+    
+    // non-blocking 모드 일시 해제
+    int flags = fcntl(c->fd, F_GETFL, 0);
+    fcntl(c->fd, F_SETFL, flags & ~O_NONBLOCK);
+    
+    // 한 번에 읽기
+    if(c->ssl) {
+        printf("Waiting for SSL authentication data...\n");
+        bytes = SSL_read(c->ssl, auth_buf, sizeof(auth_buf)-1);
+        if(bytes <= 0) {
+            int err = SSL_get_error(c->ssl, bytes);
+            printf("SSL_read failed with error: %d\n", err);
+        }
+    } else {
+        printf("Waiting for non-SSL authentication data...\n");
+        bytes = read(c->fd, auth_buf, sizeof(auth_buf)-1);
+        if(bytes <= 0) {
+            printf("Read failed with error: %s\n", strerror(errno));
+        }
+    }
+    
+    // non-blocking 모드 복원
+    fcntl(c->fd, F_SETFL, flags);
+    
+    if(bytes <= 0) {
+        printf("Failed to read authentication data (bytes: %d)\n", bytes);
+        return 0;
+    }
+    
+    auth_buf[bytes] = '\0';
+    printf("Raw received data (length: %d): %s\n", bytes, auth_buf);
+    
+    // 모든 공백 문자(newline, carriage return, space) 제거
+    char cleaned_buf[256];
+    int cleaned_len = 0;
+    
+    for(int i = 0; i < bytes; i++) {
+        if(!isspace(auth_buf[i])) {
+            cleaned_buf[cleaned_len++] = auth_buf[i];
+        }
+    }
+    cleaned_buf[cleaned_len] = '\0';
+    
+    printf("Cleaned auth data (length: %d): %s\n", cleaned_len, cleaned_buf);
+    
+    // Base64 디코딩
+    int decoded_len;
+    char *decoded = base64_decode(cleaned_buf, cleaned_len, &decoded_len);
+    if (!decoded) {
+        printf("Base64 decoding failed\n");
+        return 0;
+    }
+
+    printf("Decoded data before verification (length: %d): %s\n", decoded_len, decoded);
+    
+    int result = verifyPassword(decoded);
+    printf("Password verification result: %d\n", result);
+    free(decoded);
+    
+    if(result) {
+        c->authenticated = 1;
+        printf("Client authenticated successfully. authenticated flag set to: %d\n", c->authenticated);
+        const char *response = "OK\n";
+        if(c->ssl) {
+            SSL_write(c->ssl, response, strlen(response));
+        } else {
+            write(c->fd, response, strlen(response));
+        }
+        return 1;
+    }
+    
+    return 0;
+}
 
