@@ -48,6 +48,7 @@
 #include <openssl/bio.h>
 #include <openssl/evp.h>
 #include <openssl/buffer.h>
+#include <openssl/sha.h>
 #include <rtl-sdr.h>
 #include <json-c/json.h>
 
@@ -112,9 +113,8 @@ struct client {
 };
 
 // Function declarations
-char *base64_decode(const char *input, int length, int *outlen);
 int handleClientAuth(struct client *c);
-int verifyPassword(const char *received_hash);
+int verifyPassword(const char *received_password);
 
 const char* trusted_ips[] = {
     "127.0.0.1",      // Local host
@@ -2800,59 +2800,19 @@ int main(int argc, char **argv) {
     return 0;
 }
 
-/* Base64 디코딩 함수 */
-char *base64_decode(const char *input, int length, int *outlen) {
-    BIO *b64, *bmem;
-    
-    // SHA-256 해시(64자)를 base64로 인코딩하면 약 88자가 됩니다.
-    // 여유있게 128바이트 할당
-    char *buffer = (char *)malloc(128);
-    if (!buffer) {
-        printf("Memory allocation failed\n");
-        return NULL;
-    }
-    memset(buffer, 0, 128);
-
-    b64 = BIO_new(BIO_f_base64());
-    if (!b64) {
-        printf("Failed to create base64 BIO\n");
-        free(buffer);
-        return NULL;
-    }
-
-    BIO_set_flags(b64, BIO_FLAGS_BASE64_NO_NL); // 개행 무시
-    bmem = BIO_new_mem_buf(input, length);
-    if (!bmem) {
-        printf("Failed to create memory BIO\n");
-        BIO_free_all(b64);
-        free(buffer);
-        return NULL;
-    }
-
-    bmem = BIO_push(b64, bmem);
-    *outlen = BIO_read(bmem, buffer, 128);  // 버퍼 크기 128로 수정
-    
-    printf("Base64 input length: %d\n", length);
-    printf("Base64 input: %s\n", input);
-    printf("Decoded length: %d\n", *outlen);
-    printf("Decoded output: %s\n", buffer);
-
-    BIO_free_all(bmem);
-
-    return buffer;
-}
-
 /* Verify client password against stored hash */
-int verifyPassword(const char *received_hash) {
+int verifyPassword(const char *received_password) {
     json_object *root;
     json_object *stored_hash_obj;
+    json_object *salt_obj;
     const char *stored_hash;
+    const char *salt;
     FILE *fp;
     char buffer[4096];
     size_t size;
 
     // Read config file
-    fp = fopen("config.json", "r");
+    fp = fopen("/etc/ssl/tripleS/config.json", "r");
     if (!fp) {
         fprintf(stderr, "Error opening config.json\n");
         return 0;
@@ -2875,104 +2835,146 @@ int verifyPassword(const char *received_hash) {
         return 0;
     }
 
-    // Get password hash
+    // Get hash value and salt
     if (!json_object_object_get_ex(root, "admin_password_hash", &stored_hash_obj)) {
         fprintf(stderr, "Error: admin_password_hash not found in config.json\n");
         json_object_put(root);
         return 0;
     }
 
-    stored_hash = json_object_get_string(stored_hash_obj);
-    if (!stored_hash) {
-        fprintf(stderr, "Error: admin_password_hash is not a string\n");
+    if (!json_object_object_get_ex(root, "salt", &salt_obj)) {
+        fprintf(stderr, "Error: Cannot find salt\n");
         json_object_put(root);
         return 0;
     }
 
-    printf("Stored hash: %s\n", stored_hash);
-    printf("Received hash: %s\n", received_hash);
-    int result = (strcmp(received_hash, stored_hash) == 0);
+    stored_hash = json_object_get_string(stored_hash_obj);
+    salt = json_object_get_string(salt_obj);
+    
+    if (!stored_hash || !salt) {
+        fprintf(stderr, "Error: Hash or salt is not a string\n");
+        json_object_put(root);
+        return 0;
+    }
+    
+    // Create password + salt string
+    char salted_password[512];
+    snprintf(salted_password, sizeof(salted_password), "%s%s", received_password, salt);
+    
+    // Calculate SHA256 using EVP (OpenSSL 3.0 recommended method)
+    EVP_MD_CTX *mdctx;
+    const EVP_MD *md;
+    unsigned char hash[EVP_MAX_MD_SIZE];
+    unsigned int hash_len;
+    
+    mdctx = EVP_MD_CTX_new();
+    md = EVP_sha256();
+    
+    EVP_DigestInit_ex(mdctx, md, NULL);
+    EVP_DigestUpdate(mdctx, salted_password, strlen(salted_password));
+    EVP_DigestFinal_ex(mdctx, hash, &hash_len);
+    EVP_MD_CTX_free(mdctx);
+    
+    // Convert to hex string
+    char hex_hash[hash_len * 2 + 1];
+    for (unsigned int i = 0; i < hash_len; i++) {
+        sprintf(hex_hash + (i * 2), "%02x", hash[i]);
+    }
+    hex_hash[hash_len * 2] = '\0';
+
+    // Compare hashes
+    int match = (strcmp(hex_hash, stored_hash) == 0);
+
     json_object_put(root);
-    return result;
+    return match;
 }
 
 /* Handle client authentication */
 int handleClientAuth(struct client *c) {
-    char auth_buf[256];
-    int bytes;
+    char password[128];
+    int len;
+    int retry_count = 0;
+    const int max_retries = 5;  // Maximum retry count
     
     printf("Reading authentication data...\n");
     
-    // non-blocking 모드 일시 해제
+    // Temporarily disable non-blocking mode
     int flags = fcntl(c->fd, F_GETFL, 0);
     fcntl(c->fd, F_SETFL, flags & ~O_NONBLOCK);
     
-    // 한 번에 읽기
-    if(c->ssl) {
-        printf("Waiting for SSL authentication data...\n");
-        bytes = SSL_read(c->ssl, auth_buf, sizeof(auth_buf)-1);
-        if(bytes <= 0) {
-            int err = SSL_get_error(c->ssl, bytes);
-            printf("SSL_read failed with error: %d\n", err);
+    do {
+        // Receive plaintext password from client
+        if (c->ssl) {
+            len = SSL_read(c->ssl, password, sizeof(password) - 1);
+            int ssl_err = SSL_get_error(c->ssl, len);
+            
+            if (len <= 0) {
+                unsigned long err = ERR_get_error();
+                char err_buf[256];
+                ERR_error_string_n(err, err_buf, sizeof(err_buf));
+                printf("SSL error details: %s\n", err_buf);
+                
+                switch(ssl_err) {
+                    case SSL_ERROR_ZERO_RETURN:
+                        printf("SSL connection closed normally\n");
+                        goto cleanup;
+                    case SSL_ERROR_WANT_READ:
+                        printf("SSL_read retry... (attempt %d/%d)\n", retry_count + 1, max_retries);
+                        usleep(100000);  // Wait 0.1 seconds
+                        retry_count++;
+                        continue;
+                    case SSL_ERROR_WANT_WRITE:
+                        printf("SSL_read retry... (attempt %d/%d)\n", retry_count + 1, max_retries);
+                        usleep(100000);  // Wait 0.1 seconds
+                        retry_count++;
+                        continue;
+                    case SSL_ERROR_SYSCALL:
+                        printf("SSL system call error: %s\n", strerror(errno));
+                        goto cleanup;
+                    default:
+                        printf("Unknown SSL error\n");
+                        goto cleanup;
+                }
+            }
+        } else {
+            len = read(c->fd, password, sizeof(password) - 1);
+            if (len <= 0) goto cleanup;
         }
-    } else {
-        printf("Waiting for non-SSL authentication data...\n");
-        bytes = read(c->fd, auth_buf, sizeof(auth_buf)-1);
-        if(bytes <= 0) {
-            printf("Read failed with error: %s\n", strerror(errno));
-        }
+        
+        if (len > 0) break;  // Successfully read data, exit loop
+        
+    } while (retry_count < max_retries);
+    
+    if (len <= 0) {
+        printf("Error: Maximum retry count exceeded (%d times)\n", max_retries);
+        goto cleanup;
     }
     
-    // non-blocking 모드 복원
-    fcntl(c->fd, F_SETFL, flags);
+    password[len] = '\0';  // Null terminate string
     
-    if(bytes <= 0) {
-        printf("Failed to read authentication data (bytes: %d)\n", bytes);
-        return 0;
+    // Remove trailing newline
+    if (len > 0 && password[len-1] == '\n') {
+        password[len-1] = '\0';
+        len--;
+        printf("Newline character removed\n");
     }
     
-    auth_buf[bytes] = '\0';
-    printf("Raw received data (length: %d): %s\n", bytes, auth_buf);
-    
-    // 모든 공백 문자(newline, carriage return, space) 제거
-    char cleaned_buf[256];
-    int cleaned_len = 0;
-    
-    for(int i = 0; i < bytes; i++) {
-        if(!isspace(auth_buf[i])) {
-            cleaned_buf[cleaned_len++] = auth_buf[i];
-        }
-    }
-    cleaned_buf[cleaned_len] = '\0';
-    
-    printf("Cleaned auth data (length: %d): %s\n", cleaned_len, cleaned_buf);
-    
-    // Base64 디코딩
-    int decoded_len;
-    char *decoded = base64_decode(cleaned_buf, cleaned_len, &decoded_len);
-    if (!decoded) {
-        printf("Base64 decoding failed\n");
-        return 0;
-    }
-
-    printf("Decoded data before verification (length: %d): %s\n", decoded_len, decoded);
-    
-    int result = verifyPassword(decoded);
-    printf("Password verification result: %d\n", result);
-    free(decoded);
-    
-    if(result) {
+    // Verify password with SHA256 + Salt
+    printf("Starting password verification...\n");
+    if (verifyPassword(password)) {
         c->authenticated = 1;
-        printf("Client authenticated successfully. authenticated flag set to: %d\n", c->authenticated);
         const char *response = "OK\n";
-        if(c->ssl) {
+        if (c->ssl) {
             SSL_write(c->ssl, response, strlen(response));
         } else {
             write(c->fd, response, strlen(response));
         }
+        fcntl(c->fd, F_SETFL, flags);  // Restore original flags
         return 1;
     }
-    
+
+cleanup:
+    fcntl(c->fd, F_SETFL, flags);  // Restore original flags
     return 0;
 }
 
