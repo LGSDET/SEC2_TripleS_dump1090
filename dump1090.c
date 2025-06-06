@@ -2021,20 +2021,25 @@ void modesAcceptClients(void) {
     int fd, port;
     unsigned int j;
     struct client *c;
-    struct sockaddr_in addr;
-    socklen_t addrlen = sizeof(addr);
-    char client_ip[INET_ADDRSTRLEN];
 
     for (j = 0; j < MODES_NET_SERVICES_NUM; j++) {
-        fd = anetTcpAccept(Modes.aneterr, *modesNetServices[j].socket,
-                        client_ip, &port);
+        char client_ip[INET_ADDRSTRLEN];
+        fd = anetTcpAccept(Modes.aneterr, *modesNetServices[j].socket, client_ip, &port);
         if (fd == -1) {
             if (Modes.debug & MODES_DEBUG_NET && errno != EAGAIN)
-                printf("Accept %d: %s\n", *modesNetServices[j].socket,
-                       strerror(errno));
+                printf("Accept %d: %s\n", *modesNetServices[j].socket, strerror(errno));
             continue;
         }
-
+        if (*modesNetServices[j].socket == Modes.ris) {
+            if (!is_trusted_ip(client_ip)) {
+                printf("Blocked connection from untrusted IP: %s\n", client_ip);
+                close(fd);
+                continue;
+            }
+            else{
+                printf("Connection success for whitelist IP\n");
+            }
+        }
         if (fd >= MODES_NET_MAX_FD) {
             close(fd);
             return; /* Max number of clients reached. */
@@ -2100,6 +2105,8 @@ void modesAcceptClients(void) {
         if (fd > Modes.maxfd) Modes.maxfd = fd;
         if (c->service == Modes.sbsos)
             Modes.stat_sbs_connections++;
+
+        j--; /* Try again with the same listening port. */
 
         if (Modes.debug & MODES_DEBUG_NET)
             printf("Created new client %d\n", fd);
