@@ -2025,6 +2025,9 @@ void modesAcceptClients(void) {
     for (j = 0; j < MODES_NET_SERVICES_NUM; j++) {
         char client_ip[INET_ADDRSTRLEN];
         fd = anetTcpAccept(Modes.aneterr, *modesNetServices[j].socket, client_ip, &port);
+        if (strcmp(client_ip, "127.0.0.1") == 0) {
+            continue;
+        }
         if (fd == -1) {
             if (Modes.debug & MODES_DEBUG_NET && errno != EAGAIN)
                 printf("Accept %d: %s\n", *modesNetServices[j].socket, strerror(errno));
