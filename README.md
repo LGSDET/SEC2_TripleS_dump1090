@@ -1,3 +1,14 @@
+dump1090 서비스 시작/종료/모니터링 명령어
+
+- 서비스 종료 명령어
+sudo systemctl stop tripleS.service 
+- 서비스 재시작 명령어
+sudo systemctl restart tripleS.service
+- 서비스 상태 명령어
+systemctl status tripleS.service
+- 시스템 로그 확인 명령어
+sudo journalctl -u tripleS.service -f
+
 Dump1090 README
 ===
 
